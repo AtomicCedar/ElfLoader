@@ -28,6 +28,10 @@ import java.io.InterruptedIOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Random;
 
 public class ElfLoader {
@@ -36,6 +40,7 @@ public class ElfLoader {
     private static final int JNI_VERSION_1_4 = 0x00010004;
     private static final int JNI_VERSION_1_6 = 0x00010006;
     private static final int SHELLCODE_SIZE = 0x200;
+    private static final int ANDROID_DLEXT_USE_LIBRARY_FD = 0x10;
 
     private static final Unsafe theUnsafe;
     private static final Field artMethodField;
@@ -68,7 +73,13 @@ public class ElfLoader {
     }
 
     private long mmapAddress;
-    private int libraryFdOffset;
+    private int extinfoFdOffset;
+    private int extinfoFlagsOffset;
+    private int entrySlotOffset;
+    private int entryNameOffset;
+    private int libraryNameOffset;
+    private boolean libraryFd;
+    private final HashMap<String, LoadedLibrary> loadedLibraries = new HashMap<>();
 
     private ElfLoader() {}
 
@@ -118,9 +129,8 @@ public class ElfLoader {
         } catch (NoSuchMethodError ignored) {
         }
         Object[] arr = {srcArray};
-        int srcAddr =
-                u.getInt(arr, u.arrayBaseOffset(Object[].class))
-                        + u.arrayBaseOffset(srcArray.getClass());
+        int srcAddr = u.getInt(arr, u.arrayBaseOffset(Object[].class))
+                + u.arrayBaseOffset(srcArray.getClass());
         u.copyMemory(srcAddr, dstAddr, len);
     }
 
@@ -132,9 +142,8 @@ public class ElfLoader {
         } catch (NoSuchMethodError ignored) {
         }
         Object[] arr = {dstArray};
-        int dstAddr =
-                u.getInt(arr, u.arrayBaseOffset(Object[].class))
-                        + u.arrayBaseOffset(dstArray.getClass());
+        int dstAddr = u.getInt(arr, u.arrayBaseOffset(Object[].class))
+                + u.arrayBaseOffset(dstArray.getClass());
         u.copyMemory(srcAddr, dstAddr, len);
     }
 
@@ -150,7 +159,7 @@ public class ElfLoader {
             dlsym = elf.getSymbolAddress("_ZN7android25NativeBridgeGetTrampolineEPvPKcS2_j");
             dlerror = elf.getSymbolAddress("_ZN7android20NativeBridgeGetErrorEv");
         }
-        return dlopen == 0 || dlsym == 0 ? new long[3] : new long[] {dlopen, dlsym, dlerror};
+        return dlopen == 0 || dlsym == 0 ? new long[3] : new long[]{dlopen, dlsym, dlerror};
     }
 
     private static String toJavaString(long ptr) {
@@ -219,159 +228,141 @@ public class ElfLoader {
         switch (arch) {
             case "arm64" -> {
                 int[] shellcode = {
-                    0xd10083ff, 0xf9000ffe, 0xf9400002, 0xf9436c42, 0x910023e1, 0xd63f0040,
-                    0x10000f40, 0x52800041, 0xaa1f03e2, 0xaa1f03e3, 0x180003e5, 0x34000045,
-                    0x100002c2, 0x58000424, 0xd63f0080, 0xb40001a0, 0xf9000be0, 0x10000461,
-                    0x580003c2, 0xd63f0040, 0xaa0003e2, 0xb4000080, 0xa94087e0, 0xd63f0040,
-                    0x14000007, 0x18000040, 0x14000005, 0x00010006, 0x580002c0, 0xd63f0000,
-                    0xb2440000, 0xf9400ffe, 0x910083ff, 0xd65f03c0, 0x00000050, 0x00000000,
-                    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
-                    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+                        0xd10083ff, 0xf9000ffe, 0xf9400002, 0xf9436c42, 0x910023e1, 0xd63f0040,
+                        0x10000f40, 0x52800041, 0xaa1f03e2, 0xaa1f03e3, 0x180003e5, 0x34000045,
+                        0x100002c2, 0x58000424, 0xd63f0080, 0xb40001a0, 0xf9000be0, 0x10000461,
+                        0x580003c2, 0xd63f0040, 0xaa0003e2, 0xb4000080, 0xa94087e0, 0xd63f0040,
+                        0x14000007, 0x18000040, 0x14000005, 0x00010006, 0x580002c0, 0xd63f0000,
+                        0xb2440000, 0xf9400ffe, 0x910083ff, 0xd65f03c0, 0x00000050, 0x00000000,
+                        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+                        0x00000000, 0x00000000, 0x00000000, 0x00000000,
                 };
                 code = shellcode;
                 length = shellcode.length * 4;
-                libraryFdOffset = length - 4 * 5;
+                extinfoFdOffset = length - 4 * 5;
+                extinfoFlagsOffset = -1; // arm64: extinfo embedded in shellcode, flags already set
+                libraryNameOffset = SHELLCODE_SIZE;
+                libraryFd = true;
             }
             case "x86_64" -> {
                 byte[] shellcode = {
-                    (byte) 0x41, (byte) 0x56, (byte) 0x53, (byte) 0x50, (byte) 0x48, (byte) 0x89,
-                    (byte) 0xe6, (byte) 0x48, (byte) 0x89, (byte) 0x3e, (byte) 0x48, (byte) 0x8b,
-                    (byte) 0x07, (byte) 0xff, (byte) 0x90, (byte) 0xd8, (byte) 0x06, (byte) 0x00,
-                    (byte) 0x00, (byte) 0x48, (byte) 0x8d, (byte) 0x05, (byte) 0xb8, (byte) 0x00,
-                    (byte) 0x00, (byte) 0x00, (byte) 0x48, (byte) 0x8d, (byte) 0x3d, (byte) 0xdf,
-                    (byte) 0x01, (byte) 0x00, (byte) 0x00, (byte) 0x6a, (byte) 0x02, (byte) 0x5e,
-                    (byte) 0xff, (byte) 0x10, (byte) 0x48, (byte) 0x85, (byte) 0xc0, (byte) 0x74,
-                    (byte) 0x2c, (byte) 0x49, (byte) 0x89, (byte) 0xc6, (byte) 0x48, (byte) 0x8d,
-                    (byte) 0x05, (byte) 0xa5, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x48,
-                    (byte) 0x8d, (byte) 0x35, (byte) 0xc6, (byte) 0x00, (byte) 0x00, (byte) 0x00,
-                    (byte) 0x4c, (byte) 0x89, (byte) 0xf7, (byte) 0xff, (byte) 0x10, (byte) 0x48,
-                    (byte) 0x89, (byte) 0xc1, (byte) 0x48, (byte) 0x85, (byte) 0xc0, (byte) 0x74,
-                    (byte) 0x58, (byte) 0x48, (byte) 0x8b, (byte) 0x3c, (byte) 0x24, (byte) 0x4c,
-                    (byte) 0x89, (byte) 0xf6, (byte) 0xff, (byte) 0xd1, (byte) 0x48, (byte) 0x63,
-                    (byte) 0xd8, (byte) 0xeb, (byte) 0x70, (byte) 0x48, (byte) 0x8d, (byte) 0x0d,
-                    (byte) 0x84, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x31, (byte) 0xc0,
-                    (byte) 0xff, (byte) 0x11, (byte) 0x48, (byte) 0x89, (byte) 0xc3, (byte) 0x48,
-                    (byte) 0x8d, (byte) 0x05, (byte) 0x7e, (byte) 0x00, (byte) 0x00, (byte) 0x00,
-                    (byte) 0x48, (byte) 0x8b, (byte) 0x08, (byte) 0x48, (byte) 0x85, (byte) 0xc9,
-                    (byte) 0x74, (byte) 0x4e, (byte) 0x48, (byte) 0x8d, (byte) 0x3d, (byte) 0x85,
-                    (byte) 0x01, (byte) 0x00, (byte) 0x00, (byte) 0x6a, (byte) 0x02, (byte) 0x5e,
-                    (byte) 0xff, (byte) 0xd1, (byte) 0x48, (byte) 0x85, (byte) 0xc0, (byte) 0x74,
-                    (byte) 0x23, (byte) 0x49, (byte) 0x89, (byte) 0xc6, (byte) 0x48, (byte) 0x8d,
-                    (byte) 0x05, (byte) 0x63, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x48,
-                    (byte) 0x8d, (byte) 0x35, (byte) 0x6c, (byte) 0x00, (byte) 0x00, (byte) 0x00,
-                    (byte) 0x4c, (byte) 0x89, (byte) 0xf7, (byte) 0x31, (byte) 0xd2, (byte) 0x31,
-                    (byte) 0xc9, (byte) 0xff, (byte) 0x10, (byte) 0xeb, (byte) 0xa0, (byte) 0xbb,
-                    (byte) 0x06, (byte) 0x00, (byte) 0x01, (byte) 0x00, (byte) 0xeb, (byte) 0x1f,
-                    (byte) 0x48, (byte) 0x8d, (byte) 0x05, (byte) 0x4b, (byte) 0x00, (byte) 0x00,
-                    (byte) 0x00, (byte) 0x48, (byte) 0x8b, (byte) 0x08, (byte) 0x48, (byte) 0x85,
-                    (byte) 0xc9, (byte) 0x74, (byte) 0x0b, (byte) 0x31, (byte) 0xc0, (byte) 0xff,
-                    (byte) 0xd1, (byte) 0x48, (byte) 0x85, (byte) 0xc0, (byte) 0x48, (byte) 0x0f,
-                    (byte) 0x45, (byte) 0xd8, (byte) 0x48, (byte) 0x0f, (byte) 0xba, (byte) 0xeb,
-                    (byte) 0x3c, (byte) 0x48, (byte) 0x89, (byte) 0xd8, (byte) 0x48, (byte) 0x83,
-                    (byte) 0xc4, (byte) 0x08, (byte) 0x5b, (byte) 0x41, (byte) 0x5e, (byte) 0xc3,
+                        (byte) 0x41, (byte) 0x56, (byte) 0x53, (byte) 0x50, (byte) 0x48, (byte) 0x89, (byte) 0xe6, (byte) 0x48, (byte) 0x89, (byte) 0x3e, (byte) 0x48, (byte) 0x8b,
+                        (byte) 0x07, (byte) 0xff, (byte) 0x90, (byte) 0xd8, (byte) 0x06, (byte) 0x00, (byte) 0x00, (byte) 0x48, (byte) 0x8d, (byte) 0x05, (byte) 0xcc, (byte) 0x00,
+                        (byte) 0x00, (byte) 0x00, (byte) 0x48, (byte) 0x8d, (byte) 0x3d, (byte) 0xdf, (byte) 0x01, (byte) 0x00, (byte) 0x00, (byte) 0xbe, (byte) 0x02, (byte) 0x00,
+                        (byte) 0x00, (byte) 0x00, (byte) 0x48, (byte) 0x8d, (byte) 0x15, (byte) 0xe9, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0xff, (byte) 0x15, (byte) 0xb3,
+                        (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x48, (byte) 0x85, (byte) 0xc0, (byte) 0x74, (byte) 0x30, (byte) 0x49, (byte) 0x89, (byte) 0xc6, (byte) 0x48,
+                        (byte) 0x8d, (byte) 0x05, (byte) 0xac, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x48, (byte) 0x8d, (byte) 0x35, (byte) 0xed, (byte) 0x00, (byte) 0x00,
+                        (byte) 0x00, (byte) 0x4c, (byte) 0x89, (byte) 0xf7, (byte) 0xff, (byte) 0x15, (byte) 0x9c, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x48, (byte) 0x89,
+                        (byte) 0xc1, (byte) 0x48, (byte) 0x85, (byte) 0xc0, (byte) 0x74, (byte) 0x7c, (byte) 0x48, (byte) 0x8b, (byte) 0x3c, (byte) 0x24, (byte) 0x4c, (byte) 0x89,
+                        (byte) 0xf6, (byte) 0xff, (byte) 0xd1, (byte) 0x48, (byte) 0x63, (byte) 0xd8, (byte) 0xeb, (byte) 0x73, (byte) 0x48, (byte) 0x8d, (byte) 0x0d, (byte) 0x87,
+                        (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x31, (byte) 0xc0, (byte) 0xff, (byte) 0x11, (byte) 0x48, (byte) 0x89, (byte) 0xc3, (byte) 0x48, (byte) 0x8b,
+                        (byte) 0x0d, (byte) 0x81, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x48, (byte) 0x85, (byte) 0xc9, (byte) 0x74, (byte) 0x4d, (byte) 0x48, (byte) 0x8d,
+                        (byte) 0x3d, (byte) 0x77, (byte) 0x01, (byte) 0x00, (byte) 0x00, (byte) 0xbe, (byte) 0x02, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0xff, (byte) 0xd1,
+                        (byte) 0x48, (byte) 0x85, (byte) 0xc0, (byte) 0x74, (byte) 0x1c, (byte) 0x49, (byte) 0x89, (byte) 0xc6, (byte) 0x48, (byte) 0x8d, (byte) 0x05, (byte) 0x67,
+                        (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x48, (byte) 0x8d, (byte) 0x35, (byte) 0x90, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x4c, (byte) 0x89,
+                        (byte) 0xf7, (byte) 0x31, (byte) 0xd2, (byte) 0x31, (byte) 0xc9, (byte) 0xff, (byte) 0x10, (byte) 0xeb, (byte) 0x2a, (byte) 0x48, (byte) 0x8d, (byte) 0x05,
+                        (byte) 0x3e, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x48, (byte) 0x8b, (byte) 0x0d, (byte) 0x37, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x48,
+                        (byte) 0x85, (byte) 0xc9, (byte) 0x74, (byte) 0x0b, (byte) 0x31, (byte) 0xc0, (byte) 0xff, (byte) 0xd1, (byte) 0x48, (byte) 0x85, (byte) 0xc0, (byte) 0x48,
+                        (byte) 0x0f, (byte) 0x45, (byte) 0xd8, (byte) 0x48, (byte) 0x0f, (byte) 0xba, (byte) 0xeb, (byte) 0x3c, (byte) 0xeb, (byte) 0x05, (byte) 0xbb, (byte) 0x06,
+                        (byte) 0x00, (byte) 0x01, (byte) 0x00, (byte) 0x48, (byte) 0x89, (byte) 0xd8, (byte) 0x48, (byte) 0x83, (byte) 0xc4, (byte) 0x08, (byte) 0x5b, (byte) 0x41,
+                        (byte) 0x5e, (byte) 0xc3
                 };
                 code = shellcode;
                 length = shellcode.length;
-                nativeBridgeFunctions = getNativeBridgeFunctions();
-            }
-            case "riscv64" -> {
-                char[] shellcode = {
-                    0x7179, 0xf406, 0xf022, 0xec26, 0xe84a, 0x1597, 0x0000, 0xb583, 0x2c65, 0x6190,
-                    0x892a, 0x0517, 0x0000, 0x0513, 0x1ea5, 0x4589, 0x9602, 0xc915, 0x84aa, 0x1517,
-                    0x0000, 0x3503, 0x2b25, 0x6110, 0x0517, 0x0000, 0x0593, 0x0625, 0x8526, 0x9602,
-                    0xc51d, 0x842a, 0x3503, 0x0009, 0x3603, 0x6d85, 0x002c, 0x854a, 0x9602, 0x6522,
-                    0x85a6, 0x9402, 0xa829, 0x1517, 0x0000, 0x3503, 0x28a5, 0x6108, 0x9502, 0x4585,
-                    0x15f2, 0x8d4d, 0xa019, 0x6541, 0x2519, 0x70a2, 0x7402, 0x64e2, 0x6942, 0x6145,
-                    0x8082,
-                };
-                code = shellcode;
-                length = shellcode.length * 2;
+                extinfoFdOffset = length + 48 + 24;
+                extinfoFlagsOffset = length + 48;
+                entrySlotOffset = length + 80;
+                libraryNameOffset = SHELLCODE_SIZE;
+                libraryFd = false;
             }
             case "arm" -> {
                 int[] shellcode = {
-                    0xe92d48fc, 0xe28db018, 0xe59f2084, 0xe1a05000, 0xe3a01000, 0xe3a04000,
-                    0xe28f0e1e, 0xe12fff32, 0xe3500000, 0x0a000014, 0xe1a06000, 0xe59f2064,
-                    0xe1a00006, 0xe28f1064, 0xe12fff32, 0xe3500000, 0x0a00000a, 0xe1a07000,
-                    0xe5950000, 0xe28d1004, 0xe590236c, 0xe1a00005, 0xe12fff32, 0xe59d0004,
-                    0xe1a01006, 0xe12fff37, 0xe1a04fc0, 0xea000005, 0xe59f0000, 0xea000003,
-                    0x00010006, 0xe59f0018, 0xe12fff30, 0xe3a04201, 0xe1a01004, 0xe24bd010,
-                    0xe8bd88f0,
+                        0xe92d48f0, 0xe28db014, 0xe1a05000, 0xe24dd008, 0xe3a01000, 0xe5952000,
+                        0xe28d1004, 0xe592236c, 0xe1a00005, 0xe12fff32, 0xe59d0004, 0xe3a04000,
+                        0xe59fc07c, 0xe28f00e4, 0xe3a01000, 0xe28f20ac, 0xe12fff3c, 0xe3500000,
+                        0x0a000010, 0xe1a06000, 0xe59fc060, 0xe1a00006, 0xe28f1070, 0xe12fff3c,
+                        0xe3500000, 0x0a000006, 0xe1a07000, 0xe59d0004, 0xe1a01006, 0xe12fff37,
+                        0xe1a04000, 0xe1a05fc0, 0xea000007, 0xe3a04006, 0xe3844801, 0xea000004,
+                        0xe59fc024, 0xe12fff3c, 0xe3500000, 0x11a04000, 0xe3855201, 0xe1a00004,
+                        0xe1a01005, 0xe24bd014, 0xe8bd88f0
                 };
                 code = shellcode;
                 length = shellcode.length * 4;
+                extinfoFlagsOffset = length + 60;
+                extinfoFdOffset = length + 80;
+                entrySlotOffset = length + 28;
+                libraryNameOffset = length + 108;
+                libraryFd = true;
             }
             case "x86" -> {
                 byte[] shellcode = {
-                    (byte) 0x55, (byte) 0x89, (byte) 0xe5, (byte) 0x53, (byte) 0x57, (byte) 0x56,
-                    (byte) 0x83, (byte) 0xe4, (byte) 0xf0, (byte) 0x83, (byte) 0xec, (byte) 0x10,
-                    (byte) 0xe8, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x5b,
-                    (byte) 0x81, (byte) 0xc3, (byte) 0x3b, (byte) 0x12, (byte) 0x00, (byte) 0x00,
-                    (byte) 0x8d, (byte) 0x45, (byte) 0x08, (byte) 0x8b, (byte) 0x08, (byte) 0x8b,
-                    (byte) 0x11, (byte) 0x83, (byte) 0xec, (byte) 0x08, (byte) 0x50, (byte) 0x51,
-                    (byte) 0xff, (byte) 0x92, (byte) 0x6c, (byte) 0x03, (byte) 0x00, (byte) 0x00,
-                    (byte) 0x83, (byte) 0xc4, (byte) 0x08, (byte) 0x8d, (byte) 0xb3, (byte) 0xb4,
-                    (byte) 0xef, (byte) 0xff, (byte) 0xff, (byte) 0x6a, (byte) 0x00, (byte) 0x56,
-                    (byte) 0xff, (byte) 0x93, (byte) 0x8e, (byte) 0xee, (byte) 0xff, (byte) 0xff,
-                    (byte) 0x83, (byte) 0xc4, (byte) 0x10, (byte) 0x85, (byte) 0xc0, (byte) 0x74,
-                    (byte) 0x2f, (byte) 0x89, (byte) 0xc7, (byte) 0x83, (byte) 0xec, (byte) 0x08,
-                    (byte) 0x8d, (byte) 0x83, (byte) 0xa6, (byte) 0xee, (byte) 0xff, (byte) 0xff,
-                    (byte) 0x50, (byte) 0x57, (byte) 0xff, (byte) 0x93, (byte) 0x92, (byte) 0xee,
-                    (byte) 0xff, (byte) 0xff, (byte) 0x83, (byte) 0xc4, (byte) 0x10, (byte) 0x85,
-                    (byte) 0xc0, (byte) 0x74, (byte) 0x50, (byte) 0x83, (byte) 0xec, (byte) 0x08,
-                    (byte) 0x57, (byte) 0xff, (byte) 0x75, (byte) 0x08, (byte) 0xff, (byte) 0xd0,
-                    (byte) 0x83, (byte) 0xc4, (byte) 0x10, (byte) 0x89, (byte) 0xc7, (byte) 0x89,
-                    (byte) 0xc2, (byte) 0xc1, (byte) 0xfa, (byte) 0x1f, (byte) 0xeb, (byte) 0x5e,
-                    (byte) 0xff, (byte) 0x93, (byte) 0x96, (byte) 0xee, (byte) 0xff, (byte) 0xff,
-                    (byte) 0x89, (byte) 0xc7, (byte) 0x8b, (byte) 0x83, (byte) 0x9a, (byte) 0xee,
-                    (byte) 0xff, (byte) 0xff, (byte) 0x85, (byte) 0xc0, (byte) 0x74, (byte) 0x47,
-                    (byte) 0x89, (byte) 0x7c, (byte) 0x24, (byte) 0x08, (byte) 0x83, (byte) 0xec,
-                    (byte) 0x08, (byte) 0x6a, (byte) 0x00, (byte) 0x56, (byte) 0xff, (byte) 0xd0,
-                    (byte) 0x83, (byte) 0xc4, (byte) 0x10, (byte) 0x85, (byte) 0xc0, (byte) 0x74,
-                    (byte) 0x1f, (byte) 0x89, (byte) 0xc7, (byte) 0x8d, (byte) 0x83, (byte) 0xa6,
-                    (byte) 0xee, (byte) 0xff, (byte) 0xff, (byte) 0x6a, (byte) 0x00, (byte) 0x6a,
-                    (byte) 0x00, (byte) 0x50, (byte) 0x57, (byte) 0xff, (byte) 0x93, (byte) 0x9e,
-                    (byte) 0xee, (byte) 0xff, (byte) 0xff, (byte) 0xeb, (byte) 0xa9, (byte) 0x31,
-                    (byte) 0xd2, (byte) 0xbf, (byte) 0x06, (byte) 0x00, (byte) 0x01, (byte) 0x00,
-                    (byte) 0xeb, (byte) 0x1a, (byte) 0x8b, (byte) 0x83, (byte) 0xa2, (byte) 0xee,
-                    (byte) 0xff, (byte) 0xff, (byte) 0x85, (byte) 0xc0, (byte) 0x8b, (byte) 0x7c,
-                    (byte) 0x24, (byte) 0x08, (byte) 0x74, (byte) 0x07, (byte) 0xff, (byte) 0xd0,
-                    (byte) 0x85, (byte) 0xc0, (byte) 0x0f, (byte) 0x45, (byte) 0xf8, (byte) 0xba,
-                    (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x10, (byte) 0x89, (byte) 0xf8,
-                    (byte) 0x8d, (byte) 0x65, (byte) 0xf4, (byte) 0x5e, (byte) 0x5f, (byte) 0x5b,
-                    (byte) 0x5d, (byte) 0xc3,
+                        (byte) 0x55, (byte) 0x89, (byte) 0xe5, (byte) 0x53, (byte) 0x57, (byte) 0x56, (byte) 0x83, (byte) 0xe4, (byte) 0xf0, (byte) 0x83, (byte) 0xec, (byte) 0x10,
+                        (byte) 0xe8, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x5b, (byte) 0x8d, (byte) 0x45, (byte) 0x08, (byte) 0x8b, (byte) 0x08, (byte) 0x8b,
+                        (byte) 0x11, (byte) 0x83, (byte) 0xec, (byte) 0x08, (byte) 0x50, (byte) 0x51, (byte) 0xff, (byte) 0x92, (byte) 0x6c, (byte) 0x03, (byte) 0x00, (byte) 0x00,
+                        (byte) 0x83, (byte) 0xc4, (byte) 0x08, (byte) 0x8d, (byte) 0xb3, (byte) 0xef, (byte) 0x01, (byte) 0x00, (byte) 0x00, (byte) 0x31, (byte) 0xff, (byte) 0x31,
+                        (byte) 0xd2, (byte) 0x8d, (byte) 0x83, (byte) 0xa3, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x50, (byte) 0x6a, (byte) 0x00, (byte) 0x56, (byte) 0x8b,
+                        (byte) 0x83, (byte) 0x8a, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0xff, (byte) 0xd0, (byte) 0x83, (byte) 0xc4, (byte) 0x0c, (byte) 0x85, (byte) 0xc0,
+                        (byte) 0x74, (byte) 0x31, (byte) 0x89, (byte) 0xc7, (byte) 0x83, (byte) 0xec, (byte) 0x08, (byte) 0x8d, (byte) 0x83, (byte) 0xc7, (byte) 0x00, (byte) 0x00,
+                        (byte) 0x00, (byte) 0x50, (byte) 0x57, (byte) 0x8b, (byte) 0x83, (byte) 0x8e, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0xff, (byte) 0xd0, (byte) 0x83,
+                        (byte) 0xc4, (byte) 0x10, (byte) 0x85, (byte) 0xc0, (byte) 0x74, (byte) 0x26, (byte) 0x83, (byte) 0xec, (byte) 0x08, (byte) 0x57, (byte) 0xff, (byte) 0x75,
+                        (byte) 0x08, (byte) 0xff, (byte) 0xd0, (byte) 0x83, (byte) 0xc4, (byte) 0x10, (byte) 0x89, (byte) 0xc7, (byte) 0x89, (byte) 0xc2, (byte) 0xc1, (byte) 0xfa,
+                        (byte) 0x1f, (byte) 0xeb, (byte) 0x16, (byte) 0x8b, (byte) 0x83, (byte) 0x92, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0xff, (byte) 0xd0, (byte) 0x89,
+                        (byte) 0xc7, (byte) 0xba, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x10, (byte) 0xeb, (byte) 0x05, (byte) 0xbf, (byte) 0x06, (byte) 0x00, (byte) 0x01,
+                        (byte) 0x00, (byte) 0x89, (byte) 0xf8, (byte) 0x8d, (byte) 0x65, (byte) 0xf4, (byte) 0x5e, (byte) 0x5f, (byte) 0x5b, (byte) 0x5d, (byte) 0xc3
                 };
                 code = shellcode;
                 length = shellcode.length;
                 nativeBridgeFunctions = getNativeBridgeFunctions();
+                extinfoFlagsOffset = length + 25;
+                extinfoFdOffset = length + 45;
+                entrySlotOffset = length + 61;
+                libraryNameOffset = SHELLCODE_SIZE;
+                libraryFd = true;
             }
             default -> throw new RuntimeException(arch + " is unsupported");
         }
 
         var u = theUnsafe;
         copyMemory(code, mem, length);
-        if (u.addressSize() == 8) {
+        var mem64 = u.addressSize() == 8;
+        if (extinfoFlagsOffset >= 0) {
+            // new-style: slots at fixed offsets baked into the shellcode
+            if (mem64) {
+                u.putLong(mem + length, dlopen);
+                u.putLong(mem + length + 8, dlsym);
+                u.putLong(mem + length + 16, dlerror);
+                if (nativeBridgeFunctions != null) {
+                    u.putLong(mem + length + 24, nativeBridgeFunctions[0]);
+                    u.putLong(mem + length + 32, nativeBridgeFunctions[1]);
+                    u.putLong(mem + length + 40, nativeBridgeFunctions[2]);
+                }
+                u.putLong(mem + extinfoFlagsOffset, 0); // flags = plain dlopen
+                u.putLong(mem + extinfoFlagsOffset + 8, 0); // reserved_addr
+                u.putLong(mem + extinfoFlagsOffset + 16, 0); // reserved_size
+            } else {
+                u.putInt(mem + length, (int) dlopen);
+                u.putInt(mem + length + 4, (int) dlsym);
+                u.putInt(mem + length + 8, (int) dlerror);
+                if (nativeBridgeFunctions != null) {
+                    u.putInt(mem + length + 12, (int) nativeBridgeFunctions[0]);
+                    u.putInt(mem + length + 16, (int) nativeBridgeFunctions[1]);
+                    u.putInt(mem + length + 20, (int) nativeBridgeFunctions[2]);
+                }
+                u.putInt(mem + extinfoFlagsOffset, 0);
+                u.putInt(mem + extinfoFlagsOffset + 4, 0);
+                u.putInt(mem + extinfoFlagsOffset + 8, 0);
+            }
+            entryNameOffset = entrySlotOffset;
+            putString(mem + entrySlotOffset, "JNI_OnLoad");
+        } else {
+            // arm64: legacy slot chain, extinfo embedded in the shellcode itself
             u.putLong(mem += length, dlopen);
             u.putLong(mem += 8, dlsym);
             u.putLong(mem += 8, dlerror);
-            if (nativeBridgeFunctions != null) {
-                u.putLong(mem += 8, nativeBridgeFunctions[0]);
-                u.putLong(mem += 8, nativeBridgeFunctions[1]);
-                u.putLong(mem += 8, nativeBridgeFunctions[2]);
-            }
             mem += 8;
-        } else {
-            u.putInt(mem += length, (int) dlopen);
-            u.putInt(mem += 4, (int) dlsym);
-            u.putInt(mem += 4, (int) dlerror);
-            if (nativeBridgeFunctions != null) {
-                u.putInt(mem += 4, (int) nativeBridgeFunctions[0]);
-                u.putInt(mem += 4, (int) nativeBridgeFunctions[1]);
-                u.putInt(mem += 4, (int) nativeBridgeFunctions[2]);
-            }
-            mem += 4;
+            entryNameOffset = (int) (mem - mmapAddress);
+            putString(mem, "JNI_OnLoad");
         }
-
-        putString(mem, "JNI_OnLoad");
     }
 
     private boolean ensureInitialized() {
@@ -383,23 +374,15 @@ public class ElfLoader {
 
             var arch = ApiBridge.VMRuntime_vmInstructionSet();
             var is64Bit = u.addressSize() == 8;
-            var hasMemoryElfSupport = "arm64".equals(arch);
+            var hasMemoryElfSupport = true;
             var dl = new ElfImg(is64Bit ? "/system/lib64/libdl.so" : "/system/lib/libdl.so");
 
             long dlopen, dlsym, dlerror;
 
             if (dl.isEmpty()) {
                 // sdk < 26
-                var linker =
-                        new ElfImg(is64Bit ? "/system/bin/linker64" : "/system/bin/linker", true);
-                if (hasMemoryElfSupport) {
-                    dlopen = linker.getSymbolAddressBestMatch("android_dlopen_ext");
-                } else {
-                    dlopen = linker.getSymbolAddress("__dl_dlopen");
-                    if (dlopen == 0) {
-                        dlopen = linker.getSymbolAddressBestMatch("8__dlopen");
-                    }
-                }
+                var linker = new ElfImg(is64Bit ? "/system/bin/linker64" : "/system/bin/linker", true);
+                dlopen = linker.getSymbolAddressBestMatch("android_dlopen_ext");
                 if (dlopen == 0) {
                     throw new UnsupportedOperationException("dlopen not found in linker");
                 }
@@ -434,13 +417,23 @@ public class ElfLoader {
     }
 
     public boolean load(String path) {
-        if (!ensureInitialized() || path.length() >= 0x1000 - SHELLCODE_SIZE) return false;
-        putString(mmapAddress + SHELLCODE_SIZE, path);
+        return load(path, null);
+    }
+
+    /**
+     * Loads a library from a file path, calling a custom entry symbol instead of {@code JNI_OnLoad}
+     * when {@code entrySymbol} is non-null. Falls back to no entry call when the symbol is absent.
+     */
+    public boolean load(String path, String entrySymbol) {
+        if (!ensureInitialized() || path.length() >= 0x1000 - libraryNameOffset) return false;
+        putString(mmapAddress + libraryNameOffset, path);
+        if (entrySymbol != null) {
+            putString(mmapAddress + entryNameOffset, entrySymbol);
+        }
         var result = callNativeMethod();
-        var msg =
-                result >>> 56 != 0x10
-                        ? getJniReturnedMessage(path, (int) result)
-                        : toJavaString(result & ((1L << 56) - 1));
+        var msg = result >>> 56 != 0x10
+                ? getJniReturnedMessage(path, (int) result)
+                : toJavaString(result & ((1L << 56) - 1));
         if (msg != null) {
             throw new UnsatisfiedLinkError(msg);
         }
@@ -448,22 +441,28 @@ public class ElfLoader {
     }
 
     public boolean load(byte[] elf) {
-        return load(elf, 0, elf.length, null);
+        return load(elf, 0, elf.length, null, null);
     }
 
     public boolean load(byte[] elf, String libraryId) {
-        return load(elf, 0, elf.length, libraryId);
+        return load(elf, 0, elf.length, libraryId, null);
+    }
+
+    public boolean load(byte[] elf, String libraryId, String entrySymbol) {
+        return load(elf, 0, elf.length, libraryId, entrySymbol);
     }
 
     public boolean load(byte[] elf, int off, int len, String libraryId) {
-        // TODO: sdk < 30 support
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            throw new UnsupportedOperationException("memfd not available");
-        }
+        return load(elf, off, len, libraryId, null);
+    }
 
-        // TODO: Supports more architectures
-        if (!"arm64".equals(ApiBridge.VMRuntime_vmInstructionSet())) {
-            throw new UnsupportedOperationException("Function not implemented");
+    /**
+     * Loads an in-memory library, calling a custom entry symbol instead of {@code JNI_OnLoad} when
+     * {@code entrySymbol} is non-null. Falls back to no entry call when the symbol is absent.
+     */
+    public boolean load(byte[] elf, int off, int len, String libraryId, String entrySymbol) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            throw new UnsupportedOperationException("memfd not available");
         }
 
         if (libraryId == null) {
@@ -475,7 +474,7 @@ public class ElfLoader {
             libraryId = new String(chars);
         }
 
-        if (!ensureInitialized() || libraryId.length() >= 0x1000 - SHELLCODE_SIZE) return false;
+        if (!ensureInitialized() || libraryId.length() >= 0x1000 - libraryNameOffset) return false;
 
         FileDescriptor fd;
         try {
@@ -486,22 +485,36 @@ public class ElfLoader {
         }
 
         String libraryName;
-        if (libraryFdOffset != 0) {
-            // aarch64
+        if (extinfoFlagsOffset < 0) {
+            // arm64: extinfo embedded in the shellcode, fd passed directly
             libraryName = libraryId;
-            theUnsafe.putInt(mmapAddress + libraryFdOffset, getFdInt(fd));
+            theUnsafe.putInt(mmapAddress + extinfoFdOffset, getFdInt(fd));
+        } else if (libraryFd) {
+            // arm/x86: fd passed through extinfo (ANDROID_DLEXT_USE_LIBRARY_FD)
+            libraryName = libraryId;
+            theUnsafe.putInt(mmapAddress + extinfoFlagsOffset, ANDROID_DLEXT_USE_LIBRARY_FD);
+            theUnsafe.putInt(mmapAddress + extinfoFlagsOffset + 4, 0);
+            theUnsafe.putInt(mmapAddress + extinfoFdOffset, getFdInt(fd));
         } else {
+            // x86_64: dlopen(/proc/self/fd/N); extinfo flags stay 0
             libraryName = "/proc/self/fd/" + getFdInt(fd);
         }
-        putString(mmapAddress + SHELLCODE_SIZE, libraryName);
+        putString(mmapAddress + libraryNameOffset, libraryName);
+        if (entrySymbol != null) {
+            putString(mmapAddress + entryNameOffset, entrySymbol);
+        }
 
         long result;
 
         try {
             result = callNativeMethod();
         } finally {
-            if (libraryFdOffset != 0) {
-                theUnsafe.putInt(mmapAddress + libraryFdOffset, 0);
+            if (extinfoFdOffset != 0) {
+                theUnsafe.putInt(mmapAddress + extinfoFdOffset, 0);
+            }
+            if (extinfoFlagsOffset >= 0) {
+                theUnsafe.putInt(mmapAddress + extinfoFlagsOffset, 0);
+                theUnsafe.putInt(mmapAddress + extinfoFlagsOffset + 4, 0);
             }
             try {
                 Os.close(fd);
@@ -509,15 +522,71 @@ public class ElfLoader {
             }
         }
 
-        var msg =
-                result >>> 56 != 0x10
-                        ? getJniReturnedMessage(libraryId, (int) result)
-                        : toJavaString(result & ((1L << 56) - 1));
+        var msg = result >>> 56 != 0x10
+                ? getJniReturnedMessage(libraryId, (int) result)
+                : toJavaString(result & ((1L << 56) - 1));
         if (msg != null) {
             throw new UnsatisfiedLinkError(msg);
         }
+
+        cacheLoadedLibrary(libraryId, elf, off, len);
         return true;
     }
+
+    /**
+     * Returns the load base of a library previously loaded via {@link #load(byte[], String)}, or 0
+     * if not found.
+     */
+    public long getLoadedBase(String libraryId) {
+        var lib = loadedLibraries.get(libraryId);
+        return lib == null ? 0 : lib.base;
+    }
+
+    /**
+     * Returns the symbols of a library previously loaded via {@link #load(byte[], String)}, or null
+     * if not found. Addresses are absolute (base + st_value).
+     */
+    public Map<String, Long> getLoadedSymbols(String libraryId) {
+        var lib = loadedLibraries.get(libraryId);
+        return lib == null ? null : lib.symbols;
+    }
+
+    /**
+     * Resolves a symbol in a library previously loaded via {@link #load(byte[], String)}, or 0 if
+     * not found.
+     */
+    public long getLoadedSymbolAddress(String libraryId, String symbol) {
+        var symbols = getLoadedSymbols(libraryId);
+        if (symbols == null) return 0;
+        var address = symbols.get(symbol);
+        return address == null ? 0 : address;
+    }
+
+    private void cacheLoadedLibrary(String libraryId, byte[] elf, int off, int len) {
+        var base = findMemfdBase(libraryId);
+        if (base == 0) return;
+        var bytes = new byte[len];
+        System.arraycopy(elf, off, bytes, 0, len);
+        var img = new ElfImg(bytes, base, true);
+        loadedLibraries.put(libraryId, new LoadedLibrary(base, img.getSymbols()));
+    }
+
+    private static long findMemfdBase(String libraryId) {
+        var suffix = "/memfd:" + libraryId + " (deleted)";
+        try (var reader = new BufferedReader(new FileReader("/proc/self/maps"))) {
+            var first = 0L;
+            for (String line; (line = reader.readLine()) != null; ) {
+                if (!line.endsWith(suffix)) continue;
+                var start = Long.parseLong(line.substring(0, line.indexOf('-')), 16);
+                if (first == 0 || start < first) first = start;
+            }
+            return first;
+        } catch (Exception ignored) {
+            return 0;
+        }
+    }
+
+    private record LoadedLibrary(long base, Map<String, Long> symbols) {}
 
     public void release() {
         if (mmapAddress == 0) return;
@@ -526,6 +595,13 @@ public class ElfLoader {
         } catch (ErrnoException ignored) {
         }
         mmapAddress = 0;
+        entryNameOffset = 0;
+        extinfoFdOffset = 0;
+        extinfoFlagsOffset = 0;
+        entrySlotOffset = 0;
+        libraryNameOffset = 0;
+        libraryFd = false;
+        loadedLibraries.clear();
         instance = null;
     }
 }
